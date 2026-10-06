@@ -1,0 +1,152 @@
+#!/bin/sh
+############################################################ LICENSE
+#
+# Copyright (c) 2026 Devin Teske <dteske@FreeBSD.org>
+#
+# SPDX-License-Identifier: BSD-2-Clause
+#
+############################################################ IDENT(1)
+#
+# $Title: List playable audio outputs $
+# $Copyright: 2026 Devin Teske. All rights reserved. $
+# $FrauBSD: bhotkeys-audio/bin/audio-output-devices 2026-10-05 17:36:32 -0700 Devin Teske $
+#
+############################################################ INFORMATION
+#
+# One line each, ordered by pcm unit:
+#   pcm kind pulse_sink description
+#
+# Speakers: Internal Analog and built-in speaker descriptions.  Everything else
+# with playback is headphone-class (TRS jack, USB dongle, expansion-card jack,
+# dock audio, ...).
+#
+############################################################ GLOBALS
+
+pgm="${0##*/}" # Program basename
+
+TMP="${TMPDIR:-/tmp}/audio-output-devices.$$"
+
+############################################################ FUNCTIONS
+
+quietly() { "$@" > /dev/null 2>&1; }
+have() { quietly command -v "$@"; }
+
+#
+# Ensure Pulse has an oss_output.dspN sink for each playable /dev/dspN.
+#
+ensure_pulse_sinks()
+{
+	local play= d= u= sink=
+
+	have pactl || return 0
+	quietly pactl info || return 0
+
+	if [ -r /dev/sndstat ]; then
+		play=$( awk '
+			/^pcm[0-9]+:/ {
+				u = $1
+				sub(/^pcm/, "", u)
+				sub(/:.*/, "", u)
+				if ($0 ~ /\(play/) print u
+			}
+		' /dev/sndstat )
+	fi
+	if [ ! "$play" ]; then
+		for d in /dev/dsp[0-9]*; do
+			[ -e "$d" ] || continue
+			play="$play ${d#/dev/dsp}"
+		done
+	fi
+
+	for u in $play; do
+		sink="oss_output.dsp$u"
+		if pactl list short sinks 2> /dev/null | awk -v s="$sink" \
+			'$2 == s { found=1 } END { exit !found }'
+		then
+			continue
+		fi
+		pactl load-module module-oss \
+			device="/dev/dsp$u" \
+			sink_name="$sink" \
+			source_name="oss_input.dsp$u" \
+			> /dev/null 2>&1 || : module load failed
+	done
+}
+
+classify_kind()
+{
+	local desc=
+
+	desc=$( printf "%s\n" "$1" | tr '[:upper:]' '[:lower:]' )
+	case "$desc" in
+	*internal\ analog*|*internal\ speaker*|*speaker\ analog*|*\ speakers*)
+		printf "speakers"
+		;;
+	*)
+		printf "headphones"
+	esac
+}
+
+emit_row()
+{
+	local unit="$1" sink="$2" desc="$3"
+	local kind=
+
+	kind=$( classify_kind "$desc" )
+	printf "%s %s %s %s\n" "$unit" "$kind" "$sink" "$desc"
+}
+
+############################################################ MAIN
+
+set -e # errexit
+
+export LANG=C
+
+ensure_pulse_sinks
+
+:> "$TMP.raw"
+if have pactl && quietly pactl info; then
+	pactl list sinks 2> /dev/null | awk '
+		/Name:/ {
+			name = $2
+			for (i = 3; i <= NF; i++) name = name " " $i
+		}
+		/Description:/ {
+			desc = $2
+			for (i = 3; i <= NF; i++) desc = desc " " $i
+			if (name ~ /^oss_output\.dsp[0-9]+$/) {
+				u = name
+				sub(/^oss_output\.dsp/, "", u)
+				printf "%s\t%s\t%s\n", u, name, desc
+			}
+		}
+	' | sort -n > "$TMP.raw"
+fi
+
+if [ ! -s "$TMP.raw" ] && [ -r /dev/sndstat ]; then
+	awk '
+		/^pcm[0-9]+:/ {
+			u = $1
+			sub(/^pcm/, "", u)
+			sub(/:.*/, "", u)
+			if ($0 !~ /\(play/) next
+			desc = $0
+			sub(/^[^:]+: */, "", desc)
+			sub(/ \(play.*/, "", desc)
+			printf "%s\toss_output.dsp%s\t%s\n", u, u, desc
+		}
+	' /dev/sndstat | sort -n > "$TMP.raw"
+fi
+
+:> "$TMP.out"
+while IFS=$( printf "\t" ) read -r unit sink desc; do
+	[ "$unit" ] || continue
+	emit_row "$unit" "$sink" "$desc" >> "$TMP.out"
+done < "$TMP.raw"
+
+cat "$TMP.out"
+rm -f "$TMP.raw" "$TMP.out"
+
+################################################################################
+# END
+################################################################################

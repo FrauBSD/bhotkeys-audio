@@ -1,0 +1,878 @@
+#!/bin/sh
+############################################################ LICENSE
+#
+# Copyright (c) 2026 Devin Teske <dteske@FreeBSD.org>
+#
+# SPDX-License-Identifier: BSD-2-Clause
+#
+############################################################ IDENT(1)
+#
+# $Title: Adjust the active output and show the gauge $
+# $Copyright: 2026 Devin Teske. All rights reserved. $
+# $FrauBSD: bhotkeys-audio/bin/volume-osd 2026-10-05 17:36:32 -0700 Devin Teske $
+#
+############################################################ INFORMATION
+#
+# Volume keys -> active output + bosd gauge.
+#
+# Single sink: FreeBSD mixer on the matching /dev/mixerN
+# (oss_output.dspN). Combined "all outputs" sink: Pulse sink
+# volume/mute on combined_all (fans out to every slave). bhotkeys
+# calls this (XRecord; works under menu grabs).
+#
+# Keys adjust `vol` (or Pulse %) without unmuting. OSD bar is green
+# when audible, red while muted (unmute to hear). OSS also has a
+# separate `pcm` gain; leave that at 100% or "volume up" maxes out
+# while still sounding weak.
+#
+# Per-output memory (~/.cache/audio-output-volumes): each sink key
+# remembers its last pct only. Combine (Pulse) may be >100, capped
+# at 153%; OSS mixer stops at 100. Mute is global; Fn+F12 carries
+# the current mute state unchanged; OSD bar is red while muted.
+# Above 100% the bar stays full and the OSD shows "N%".
+#
+#   volume-osd up|down|mute|show|pct|key|mute-status
+#   volume-osd save|restore [fallback]|apply-mute on|off
+#
+############################################################ ENVIRONMENT
+
+DISPLAY="${DISPLAY:-:0}"
+export DISPLAY
+
+COMBINE_NAME=${AUDIO_ALL_SINK:-combined_all}
+VOLMEM_FILE=${AUDIO_VOLMEM_FILE:-$HOME/.cache/audio-output-volumes}
+
+# Greeter volume must stay mixer-only: a dead/half Pulse makes every
+# pactl get-default-sink stall for seconds and media keys feel laggy.
+PACTL_TIMEOUT=${VOLUME_OSD_PACTL_TIMEOUT:-0.35}
+
+############################################################ GLOBALS
+
+pgm="${0##*/}" # Program basename
+
+#
+# Global exit status
+#
+SUCCESS=0
+FAILURE=1
+
+MIXER=/usr/sbin/mixer
+MIX_DEV=
+
+# Pulse UI max (~+11 dB). 5% steps through 150, then one extra step to 153
+PA_VOL_MAX=153
+
+# 56 bar ticks. A raw 5% step from 0 lights 2 ticks and the next
+# 5% lights 3. Each press moves 3 ticks so the bar stays even.
+STEP=5
+TICKS=56
+NUDGE=3
+
+############################################################ FUNCTIONS
+
+quietly() { "$@" > /dev/null 2>&1; }
+have() { quietly command -v "$@"; }
+
+usage()
+{
+	exec >&2
+	echo "Usage: $pgm up|down|mute|show|pct|key|mute-status" \
+		"save|restore [fallback]|apply-mute on|off"
+	exit $FAILURE
+}
+
+# Session Pulse socket, or greeter system instance via PULSE_SERVER.
+ensure_pulse_env()
+{
+	export DISPLAY="${DISPLAY:-:0}"
+	[ "$PULSE_SERVER" ] && return $SUCCESS
+	if [ "$BHOTKEYS_GREETER" ]; then
+		# System instance (root --system -> user pulse).
+		if [ -S /var/run/pulse/native ]; then
+			export PULSE_SERVER=unix:/var/run/pulse/native
+			return $SUCCESS
+		fi
+		return $FAILURE
+	fi
+	if [ ! "$XDG_RUNTIME_DIR" ] ||
+	   [ ! -S "$XDG_RUNTIME_DIR/pulse/native" ]; then
+		[ -S "/var/run/xdg/$USER/pulse/native" ] &&
+			export XDG_RUNTIME_DIR="/var/run/xdg/$USER"
+	fi
+	[ -S "$XDG_RUNTIME_DIR/pulse/native" ] &&
+		export PULSE_RUNTIME_PATH="$XDG_RUNTIME_DIR/pulse"
+}
+
+# True when a Pulse daemon is reachable for sink identity / combine master.
+# Greeter uses the system instance; never hang on a dead user Pulse.
+use_pulse()
+{
+	[ ! "$VOLUME_OSD_NO_PULSE" ] || return $FAILURE
+	ensure_pulse_env || return $FAILURE
+	[ "$PULSE_SERVER" ] && return $SUCCESS
+	# Legacy flag: force mixer+sysctl only (no pactl). Prefer not set at
+	# greeter now that system Pulse is healthy.
+	[ ! "$VOLUME_OSD_MIXER_ONLY" ] || return $FAILURE
+	[ -S "$PULSE_RUNTIME_PATH/native" ] && return $SUCCESS
+	[ -S "$XDG_RUNTIME_DIR/pulse/native" ] && return $SUCCESS
+	return $FAILURE
+}
+
+pactl_q()
+{
+	have pactl || return $FAILURE
+	if have timeout; then
+		timeout "$PACTL_TIMEOUT" pactl "$@" 2> /dev/null
+	else
+		pactl "$@" 2> /dev/null
+	fi
+}
+
+default_sink()
+{
+	use_pulse || return $FAILURE
+	pactl_q get-default-sink ||
+		pactl_q info | awk '/^Default Sink:/ { print $3; exit }'
+}
+
+# True when default is the all-outputs combine sink.
+is_combine_master()
+{
+	local sink
+
+	use_pulse || return $FAILURE
+	sink=$( default_sink ) || return $FAILURE
+	[ "$sink" = "$COMBINE_NAME" ] && return $SUCCESS
+	case "$sink" in
+	combined*|all_outputs*|all-outputs*) return $SUCCESS ;;
+	esac
+	return $FAILURE
+}
+
+# Resolve active pcm unit (0 = internal speakers, 1 = headphones, ...).
+active_pcm_unit()
+{
+	local sink n f
+
+	sink=$( default_sink ) || sink=
+	#
+	# At the greeter, never consult the staging user's ~/.config/pulse
+	# default-sink; that stuck uaudio (dsp2) memory made every volume key
+	# hit /dev/mixer2 while Fn+F12 had already moved Pulse elsewhere.
+	#
+	if [ ! "$sink" ] && [ ! "$BHOTKEYS_GREETER" ]; then
+		for f in "$HOME"/.config/pulse/*-default-sink; do
+			[ -f "$f" ] || continue
+			sink=$( cat "$f" 2> /dev/null )
+			[ "$sink" ] && break
+		done
+	fi
+	case "$sink" in
+	oss_output.dsp[0-9]*|oss_output.dsp.*)
+		n="${sink##*dsp}"
+		n="${n%%[!0-9]*}"
+		[ "$n" ] && { printf "%s\n" "$n"; return $SUCCESS; }
+		;;
+	*dsp[0-9]*)
+		n="${sink##*dsp}"
+		n="${n%%[!0-9]*}"
+		[ "$n" ] && { printf "%s\n" "$n"; return $SUCCESS; }
+		;;
+	esac
+	sysctl -n hw.snd.default_unit 2> /dev/null || printf "0\n"
+}
+
+# Stable key for the volume map (combine name or oss_output.dspN).
+output_key()
+{
+	local unit
+
+	if is_combine_master; then
+		printf "%s\n" "$COMBINE_NAME"
+		return $SUCCESS
+	fi
+	unit=$( active_pcm_unit )
+	[ "$unit" ] || unit=0
+	printf "oss_output.dsp%s\n" "$unit"
+}
+
+mix()
+{
+	local unit
+
+	if [ ! "$MIX_DEV" ]; then
+		unit=$( active_pcm_unit )
+		[ "$unit" ] || unit=0
+		if [ -e "/dev/mixer$unit" ]; then
+			MIX_DEV="/dev/mixer$unit"
+		else
+			MIX_DEV=/dev/mixer
+		fi
+	fi
+	#
+	# The greeter log captures stdout. mixer(8) dumps the whole device
+	# table after every set; silence mutations so keys stay snappy.
+	# Query forms still need stdout.
+	#
+	case "$*" in
+	*=*) quietly $MIXER -f "$MIX_DEV" "$@" ;;
+	*) $MIXER -f "$MIX_DEV" "$@" ;;
+	esac
+}
+
+ensure_pcm_full()
+{
+	quietly mix pcm=100% || quietly mix pcm=1.00
+}
+
+# --- Pulse combine master -------------------------------------------------
+
+pa_vol_pct()
+{
+	ensure_pulse_env
+	# Average of front-left/right percentages from pactl.
+	pactl_q get-sink-volume "$COMBINE_NAME" |
+		awk '
+			{
+				n = 0
+				s = 0
+				for (i = 1; i <= NF; i++) {
+					if ($i ~ /^[0-9]+%$/) {
+						gsub(/%/, "", $i)
+						s += $i
+						n++
+					}
+				}
+				if (n > 0) printf "%d", (s / n) + 0.5
+			}'
+}
+
+pa_is_muted()
+{
+	ensure_pulse_env
+	pactl_q get-sink-mute "$COMBINE_NAME" | grep -q "yes"
+}
+
+# Next 5% step up, then 150 -> 153. Never past PA_VOL_MAX.
+pa_next_up()
+{
+	local cur="$1"
+	local n
+
+	case "$cur" in
+	""|*[!0-9]*) cur=0 ;;
+	esac
+	if [ "$cur" -ge "$PA_VOL_MAX" ]; then
+		printf "%s\n" "$PA_VOL_MAX"
+	elif [ "$cur" -ge 150 ]; then
+		printf "%s\n" "$PA_VOL_MAX"
+	else
+		n=$(( $cur / $STEP * $STEP + $STEP ))
+		[ "$n" -gt 150 ] && n=150
+		printf "%s\n" "$n"
+	fi
+}
+
+# 153 (or anything above 150) -> 150, then 5% steps down.
+pa_next_down()
+{
+	local cur="$1"
+	local n
+
+	case "$cur" in
+	""|*[!0-9]*) cur=0 ;;
+	esac
+	if [ "$cur" -gt 150 ]; then
+		printf "150\n"
+	elif [ "$cur" -le 0 ]; then
+		printf "0\n"
+	else
+		n=$(( ($cur - 1) / $STEP * $STEP ))
+		printf "%s\n" "$n"
+	fi
+}
+
+pa_vol_up()
+{
+	local cur n
+
+	ensure_pulse_env
+	# Keep mute state; volume keys adjust level without unmuting.
+	cur=$( pa_vol_pct )
+	n=$( pa_next_up "$cur" )
+	pa_vol_set "$n"
+}
+
+pa_vol_down()
+{
+	local cur n
+
+	ensure_pulse_env
+	cur=$( pa_vol_pct )
+	n=$( pa_next_down "$cur" )
+	pa_vol_set "$n"
+}
+
+pa_vol_mute_toggle()
+{
+	ensure_pulse_env
+	quietly pactl_q set-sink-mute "$COMBINE_NAME" toggle
+}
+
+pa_vol_set()
+{
+	ensure_pulse_env
+	quietly pactl_q set-sink-volume "$COMBINE_NAME" "$1%"
+}
+
+# --- OSS single-device -----------------------------------------------------
+
+vol_pct_oss()
+{
+	mix vol 2> /dev/null | sed -n 's/vol\.volume=\([0-9.]*\).*/\1/p' |
+		awk '{ printf "%d", $1 * 100 + 0.5 }'
+}
+
+is_muted_oss()
+{
+	mix vol 2> /dev/null | grep -q "mute=on"
+}
+
+# --- Per-output volume memory ---------------------------------------------
+# File lines: <key> <pct>
+# Mute is global (not stored here): cycling carries the current mute state.
+
+is_muted()
+{
+	if is_combine_master; then
+		pa_is_muted
+	else
+		is_muted_oss
+	fi
+}
+
+current_mute()
+{
+	if is_muted; then
+		printf "on\n"
+	else
+		printf "off\n"
+	fi
+}
+
+volmem_get()
+{
+	local key="$1"
+
+	[ -f "$VOLMEM_FILE" ] || return $FAILURE
+	awk -v k="$key" '$1 == k { print $2; found = 1; exit }
+		END { exit !found }' "$VOLMEM_FILE"
+}
+
+volmem_set()
+{
+	local key="$1" pct="$2"
+	local dir="${VOLMEM_FILE%/*}" tmp="$VOLMEM_FILE.$$"
+
+	[ "$dir" = "$VOLMEM_FILE" ] && dir=.
+	mkdir -p "$dir"
+	if [ -f "$VOLMEM_FILE" ]; then
+		awk -v k="$key" -v p="$pct" '
+			$1 == k { next }
+			NF >= 2 { print $1, $2 }
+			END { print k, p }
+		' "$VOLMEM_FILE" > "$tmp"
+	else
+		printf "%s %s\n" "$key" "$pct" > "$tmp"
+	fi
+	mv "$tmp" "$VOLMEM_FILE"
+}
+
+apply_pct()
+{
+	local n="$1"
+
+	case "$n" in
+	""|*[!0-9]*) return $FAILURE ;;
+	esac
+	if is_combine_master; then
+		[ "$n" -gt "$PA_VOL_MAX" ] && n="$PA_VOL_MAX"
+		pa_vol_set "$n"
+	else
+		[ "$n" -gt 100 ] && n=100
+		ensure_pcm_full
+		quietly mix "vol=$n%" || quietly mix vol=$(
+			awk -v p="$n" 'BEGIN { printf "%.2f", p / 100 }'
+		)
+	fi
+}
+
+apply_mute()
+{
+	local mute="$1"
+
+	case "$mute" in
+	on|off) : ok ;;
+	*) return $FAILURE ;;
+	esac
+	if is_combine_master; then
+		ensure_pulse_env
+		if [ "$mute" = on ]; then
+			quietly pactl_q set-sink-mute "$COMBINE_NAME" 1
+		else
+			quietly pactl_q set-sink-mute "$COMBINE_NAME" 0
+		fi
+	else
+		quietly mix "vol.mute=$mute"
+	fi
+}
+
+#
+# Apply to the named sink. The live default can already be the next
+# output while this command is still catching up.
+#
+apply_pct_key()
+{
+	local key="$1" n="$2"
+	local unit dev
+
+	case "$n" in
+	""|*[!0-9]*) return $FAILURE ;;
+	esac
+	case "$key" in
+	"$COMBINE_NAME"|combined*|all_outputs*|all-outputs*)
+		[ "$n" -gt "$PA_VOL_MAX" ] && n="$PA_VOL_MAX"
+		pa_vol_set "$n"
+		;;
+	oss_output.dsp[0-9]*)
+		unit="${key#oss_output.dsp}"
+		[ "$n" -gt 100 ] && n=100
+		dev="/dev/mixer$unit"
+		[ -e "$dev" ] || dev=/dev/mixer
+		quietly $MIXER -f "$dev" "vol=$n%" ||
+			quietly $MIXER -f "$dev" vol="$( awk -v p="$n" '
+				BEGIN { printf "%.2f", p / 100 }
+			' )"
+		;;
+	*)
+		apply_pct "$n"
+		;;
+	esac
+}
+
+apply_mute_key()
+{
+	local key="$1" how="$2"
+	local unit dev
+
+	case "$how" in
+	on|off) : ok ;;
+	1) how=on ;;
+	0) how=off ;;
+	*) return $FAILURE ;;
+	esac
+	case "$key" in
+	"$COMBINE_NAME"|combined*|all_outputs*|all-outputs*)
+		ensure_pulse_env
+		if [ "$how" = on ]; then
+			quietly pactl_q set-sink-mute "$COMBINE_NAME" 1
+		else
+			quietly pactl_q set-sink-mute "$COMBINE_NAME" 0
+		fi
+		;;
+	oss_output.dsp[0-9]*)
+		unit="${key#oss_output.dsp}"
+		dev="/dev/mixer$unit"
+		[ -e "$dev" ] || dev=/dev/mixer
+		quietly $MIXER -f "$dev" "vol.mute=$how"
+		# Pulse keeps its own mute after the mixer mute clears
+		ensure_pulse_env
+		if [ "$how" = on ]; then
+			quietly pactl_q set-sink-mute "$key" 1
+		else
+			quietly pactl_q set-sink-mute "$key" 0
+		fi
+		;;
+	*)
+		apply_mute "$how"
+		;;
+	esac
+}
+
+save_current()
+{
+	local key pct
+
+	key=$( output_key )
+	pct=$( current_pct )
+	[ "$pct" ] || return $SUCCESS
+	volmem_set "$key" "$pct"
+}
+
+#
+# Apply remembered pct for the active output. If none, use fallback (the
+# previous output's level). Mute is applied separately as a global carry.
+#
+restore_current()
+{
+	local fallback="$1"
+	local key pct
+
+	key=$( output_key )
+	pct=$( volmem_get "$key" 2> /dev/null ) || pct=
+	if [ ! "$pct" ]; then
+		pct="$fallback"
+	fi
+	if [ ! "$pct" ]; then
+		pct=$( current_pct )
+		[ "$pct" ] && volmem_set "$key" "$pct"
+		return $SUCCESS
+	fi
+	# Mixer cannot go above 100. Pulse combine caps at PA_VOL_MAX.
+	if is_combine_master; then
+		[ "$pct" -gt "$PA_VOL_MAX" ] && pct="$PA_VOL_MAX"
+	elif [ "$pct" -gt 100 ]; then
+		pct=100
+	fi
+	apply_pct "$pct"
+	volmem_set "$key" "$pct"
+}
+
+current_pct()
+{
+	if is_combine_master; then
+		pa_vol_pct
+	else
+		vol_pct_oss
+	fi
+}
+
+ticks_for()
+{
+	local p="$1"
+
+	case "$p" in
+	""|*[!0-9]*) p=0 ;;
+	esac
+	[ "$p" -gt 100 ] && p=100
+	echo $(( $TICKS * $p / 100 ))
+}
+
+pct_for_ticks()
+{
+	local t="$1"
+
+	if [ "$t" -le 0 ]; then
+		echo 0
+		return
+	fi
+	if [ "$t" -ge "$TICKS" ]; then
+		echo 100
+		return
+	fi
+	echo $(( ($t * 100 + $TICKS - 1) / $TICKS ))
+}
+
+#
+# $1 current percent, $2 up|down. Above 100 (Pulse combine) up stays
+# at the cap. A full bar steps down by 2 ticks; every other step is 3.
+# Climbing from 0 is 3 ticks until the last step (2), so down from 100
+# must use that same 2 or the earlier stops are skipped.
+#
+nudge_pct()
+{
+	local cur="$1" dir="$2"
+	local t
+
+	case "$cur" in
+	""|*[!0-9]*) cur=0 ;;
+	esac
+	if [ "$cur" -gt 100 ]; then
+		if [ "$dir" = up ]; then
+			echo "$PA_VOL_MAX"
+			return
+		fi
+		pct_for_ticks $(( $TICKS - 2 ))
+		return
+	fi
+	t=$( ticks_for "$cur" )
+	if [ "$dir" = up ]; then
+		t=$(( $t + $NUDGE ))
+	elif [ "$t" -ge "$TICKS" ]; then
+		t=$(( $TICKS - 2 ))
+	else
+		t=$(( $t - $NUDGE ))
+	fi
+	[ "$t" -lt 0 ] && t=0
+	[ "$t" -gt "$TICKS" ] && t="$TICKS"
+	pct_for_ticks "$t"
+}
+
+show_gauge()
+{
+	local prev="$1" new="$2"
+
+	[ "$prev" ] || prev=0
+	[ "$new" ] || new=0
+	if is_muted; then
+		bosd -p muted -G red -P "$prev" -g "$new"
+	else
+		bosd -P "$prev" -g "$new"
+	fi
+}
+
+show_current()
+{
+	local pct
+
+	pct=$( current_pct )
+	show_gauge "$pct" "$pct"
+}
+
+#
+# Gauge first, from a commanded level. pactl catches up in one applier
+# so a held key can step at the repeat rate and still stop on release.
+#
+show_known()
+{
+	local prev="$1" new="$2" mute="$3"
+
+	if [ "$mute" = 1 ]; then
+		bosd -p muted -G red -P "$prev" -g "$new"
+	else
+		bosd -P "$prev" -g "$new"
+	fi
+}
+
+level_file()
+{
+	local lockdir="${HOME:-/tmp}/.cache"
+
+	mkdir -p "$lockdir"
+	printf "%s\n" "$lockdir/volume-osd.level"
+}
+
+step_level()
+{
+	local dir="$1"
+	local file pct mute key old fresh=0 now mt mark
+
+	file=$( level_file )
+	if [ ! -s "$file" ]; then
+		pct=$( current_pct )
+		case "$pct" in
+		""|*[!0-9]*) pct=0 ;;
+		esac
+		mute=0
+		is_muted && mute=1
+		key=$( output_key )
+		printf "%s %s %s %s\n" "$pct" "$mute" "$pct" "$key" > "$file"
+	fi
+	read pct mute mark key < "$file" || return $FAILURE
+	[ "$key" ] || key=$( output_key )
+	old=$pct
+	now=$( date +%s )
+	mt=$( stat -f %m "$file" ) || mt=0
+	if [ $(( $now - $mt )) -lt 3 ]; then
+		fresh=1
+	fi
+	case "$dir" in
+	mute)
+		if [ "$mute" = 1 ]; then
+			mute=0
+		else
+			mute=1
+		fi
+		mark="$pct"
+		;;
+	*)
+		#
+		# -P is where this hold started. A repeat that cannot move
+		# must keep sending that -P; prev==current clears the
+		# watermark.
+		#
+		if [ "$fresh" = 0 ] || [ ! "$mark" ]; then
+			mark="$old"
+		fi
+		pct=$( nudge_pct "$old" "$dir" )
+		;;
+	esac
+	printf "%s %s %s %s\n" "$pct" "$mute" "$mark" "$key" > "$file"
+	if [ "$mark" = "$pct" ]; then
+		printf "%s %s %s\n" "$pct" "$pct" "$mute"
+	else
+		printf "%s %s %s\n" "$mark" "$pct" "$mute"
+	fi
+}
+
+apply_catchup()
+{
+	local file key key2
+	local pct mute mark p2 m2 mark2
+
+	file=$( level_file )
+	while :; do
+		read pct mute mark key < "$file" || exit $SUCCESS
+		[ "$key" ] || key=$( output_key )
+		apply_pct_key "$key" "$pct"
+		if [ "$mute" = 1 ]; then
+			apply_mute_key "$key" on
+		else
+			apply_mute_key "$key" off
+		fi
+		read p2 m2 mark2 key2 < "$file" || exit $SUCCESS
+		if [ ! "$key2" ]; then
+			printf "%s %s %s %s\n" "$pct" "$mute" "$mark" \
+				"$key" > "$file"
+			key2="$key"
+		fi
+		[ "$pct" = "$p2" ] && [ "$mute" = "$m2" ] &&
+			[ "$key" = "$key2" ] && break
+	done
+	# The sink named in the file, not whichever output is current now.
+	read pct mute mark key < "$file" || exit $SUCCESS
+	if [ "$key" = "$key2" ] && [ "$pct" ]; then
+		volmem_set "$key" "$pct"
+	fi
+}
+
+#
+# Leaving one output for another. Remember the commanded level under
+# the output it belongs to, then load the destination's own level.
+#
+handoff_level()
+{
+	local old="$1" new="$2"
+	local file pct= mute=0 mark= key= npct
+
+	file=$( level_file )
+	if [ -s "$file" ]; then
+		read pct mute mark key < "$file"
+	fi
+	# A level file with no sink yet was commanded on the output we leave.
+	if [ "$pct" ] && { [ ! "$key" ] || [ "$key" = "$old" ]; }; then
+		volmem_set "$old" "$pct"
+	fi
+	npct=$( volmem_get "$new" 2> /dev/null ) || npct=
+	[ "$npct" ] || return $SUCCESS
+	[ "$mute" ] || mute=0
+	printf "%s %s %s %s\n" "$npct" "$mute" "$npct" "$new" > "$file"
+}
+
+apply_saved()
+{
+	local key="$1"
+	local file pct mute=0 p mark k
+
+	file=$( level_file )
+	pct=$( volmem_get "$key" 2> /dev/null ) || return $SUCCESS
+	[ "$pct" ] || return $SUCCESS
+	apply_pct_key "$key" "$pct"
+	if [ -s "$file" ]; then
+		read p mute mark k < "$file" || mute=0
+	fi
+	if [ "$mute" = 1 ]; then
+		apply_mute_key "$key" on
+	else
+		apply_mute_key "$key" off
+	fi
+}
+
+fast_step()
+{
+	local dir="$1"
+	local lockdir="${HOME:-/tmp}/.cache" line
+
+	mkdir -p "$lockdir"
+	line=$( lockf -k "$lockdir/volume-osd.fast.lock" \
+		"$0" --step "$dir" ) || exit $SUCCESS
+	set -- $line # word split
+	show_known "$1" "$2" "$3"
+	quietly lockf -t 0 -k "$lockdir/volume-osd.apply.lock" \
+		"$0" --apply &
+}
+
+############################################################ MAIN
+
+case "${1:-}" in
+--step)
+	step_level "$2"
+	exit $SUCCESS
+	;;
+--apply)
+	apply_catchup
+	exit $SUCCESS
+	;;
+--handoff)
+	lockdir="${HOME:-/tmp}/.cache"
+	mkdir -p "$lockdir"
+	exec lockf -k "$lockdir/volume-osd.fast.lock" "$0" \
+		--handoff-locked "$2" "$3"
+	;;
+--handoff-locked)
+	handoff_level "$2" "$3"
+	exit $SUCCESS
+	;;
+--apply-saved)
+	apply_saved "$2"
+	exit $SUCCESS
+	;;
+up|down|mute)
+	fast_step "$1"
+	exit $SUCCESS
+	;;
+esac
+
+if [ ! "$VOLUME_OSD_LOCKED" ]; then
+	export VOLUME_OSD_LOCKED=1
+	lockdir="${HOME:-/tmp}/.cache"
+	mkdir -p "$lockdir"
+	# Do not queue. A held key used to keep stepping after release.
+	exec lockf -t 0 -k "$lockdir/volume-osd.lock" "$0" "$@"
+fi
+
+case "$1" in
+up)
+	prev=$( current_pct )
+	apply_pct "$( nudge_pct "$prev" up )"
+	save_current
+	show_gauge "$prev" "$( current_pct )"
+	;;
+down)
+	prev=$( current_pct )
+	apply_pct "$( nudge_pct "$prev" down )"
+	save_current
+	show_gauge "$prev" "$( current_pct )"
+	;;
+mute)
+	pct=$( current_pct )
+	if is_combine_master; then
+		pa_vol_mute_toggle
+	else
+		ensure_pcm_full
+		if is_muted_oss; then
+			mix vol.mute=off
+		else
+			mix vol.mute=on
+		fi
+	fi
+	save_current
+	show_gauge "$pct" "$pct"
+	;;
+show|status) show_current ;;
+pct)
+	current_pct
+	printf "\n"
+	;;
+key) output_key ;;
+save) save_current ;;
+restore) restore_current "$2" ;;
+apply-mute) apply_mute "$2" ;;
+mute-status) current_mute ;;
+*)
+	usage # NOTREACHED
+esac
+
+################################################################################
+# END
+################################################################################

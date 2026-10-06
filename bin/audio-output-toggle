@@ -1,0 +1,595 @@
+#!/bin/sh
+############################################################ LICENSE
+#
+# Copyright (c) 2026 Devin Teske <dteske@FreeBSD.org>
+#
+# SPDX-License-Identifier: BSD-2-Clause
+#
+############################################################ IDENT(1)
+#
+# $Title: Cycle the default audio output $
+# $Copyright: 2026 Devin Teske. All rights reserved. $
+# $FrauBSD: bhotkeys-audio/bin/audio-output-toggle 2026-10-05 17:36:32 -0700 Devin Teske $
+#
+############################################################ INFORMATION
+#
+# Cycle default audio output across playable devices, then "all" (combine).
+# Bound to XF86AudioMedia (Fn+F12 / gear).
+#
+#   audio-output-toggle
+#
+# OSD:
+#   speakers              -> speaker glyph
+#   headphones            -> headphone glyph (1st headphone, or only 2 outs)
+#   headphones:N (N>=2)   -> headphone glyph + superscript N (when >2 outs)
+#   all                   -> speaker glyph + superscript "All" (combine sink)
+#
+# Volume OSD follows the newly selected sink / combine master.
+#
+############################################################ ENVIRONMENT
+
+DISPLAY="${DISPLAY:-:0}"
+export DISPLAY
+
+AOT_LOCK="${AOT_LOCK:-/tmp/audio-output-toggle.lock}"
+COMBINE_NAME="${AUDIO_ALL_SINK:-combined_all}"
+ICON_FILE="${AOT_ICON_FILE:-/tmp/audio-output-toggle.icon}"
+MIXER="${MIXER:-/usr/sbin/mixer}"
+
+#
+# Greeter hotkeys run as root. Pulse there is a system instance (started as
+# root with --system, then dropped to user pulse). Prefer PULSE_SERVER;
+# never fall through into a staging-user XDG Pulse dir from greeter/root.
+#
+if [ "$BHOTKEYS_GREETER" ]; then
+	export PULSE_SERVER="${PULSE_SERVER:-unix:/var/run/pulse/native}"
+elif [ "$( id -u )" -eq 0 ]; then
+	if [ ! "$PULSE_SERVER" ] && [ -S /var/run/pulse/native ]; then
+		export PULSE_SERVER=unix:/var/run/pulse/native
+	fi
+fi
+if [ ! "$PULSE_SERVER" ]; then
+	if [ ! "$XDG_RUNTIME_DIR" ] ||
+	   [ ! -S "$XDG_RUNTIME_DIR/pulse/native" ]; then
+		if [ -S "/var/run/xdg/$USER/pulse/native" ]; then
+			export XDG_RUNTIME_DIR="/var/run/xdg/$USER"
+		fi
+	fi
+	if [ -S "$XDG_RUNTIME_DIR/pulse/native" ]; then
+		export PULSE_RUNTIME_PATH="$XDG_RUNTIME_DIR/pulse"
+	fi
+fi
+
+############################################################ GLOBALS
+
+pgm="${0##*/}" # Program basename
+
+#
+# Global exit status
+#
+SUCCESS=0
+FAILURE=1
+
+ALL_TEST=audio-output-all-test
+AOT_LOG=/tmp/audio-output-toggle.log
+DEVICES=audio-output-devices
+LIST=/tmp/audio-output-devices.$$
+START_PA=start-pulseaudio
+
+# Set by vol_before_switch, read by vol_after_switch
+prev_pct=
+prev_mute=
+
+############################################################ FUNCTIONS
+
+quietly() { "$@" > /dev/null 2>&1; }
+have() { quietly command -v "$@"; }
+
+usage()
+{
+	exec >&2
+	echo "Usage: $pgm"
+	exit $FAILURE
+}
+
+aot_log()
+{
+	# Root and others both append; keep the file world-writable.
+	( umask 0
+	  echo "$( date '+%Y-%m-%dT%H:%M:%S' ) [$$ uid=$( id -u )] $*" \
+		>> "$AOT_LOG"
+	) 2> /dev/null
+}
+
+#
+# A held F12 used to queue one full switch per repeat and keep cycling
+# after release. The glyph steps at the key; one applier catches up.
+#
+cycle_file()
+{
+	local dir="${HOME:-/tmp}/.cache"
+
+	mkdir -p "$dir"
+	printf "%s\n" "$dir/audio-output-cycle"
+}
+
+write_cycle()
+{
+	local idx="$1"
+	local file tmp i=0 hp=0 icon
+	local unit kind sink desc
+
+	file=$( cycle_file )
+	tmp="$file.tmp"
+	{
+		printf "idx %s\n" "$idx"
+		printf "slots %s\n" "$slots"
+		while read -r unit kind sink desc; do
+			icon=speakers
+			if [ "$kind" = headphones ]; then
+				hp=$(( $hp + 1 ))
+				if [ "$n" -gt 2 ] && [ "$hp" -ge 2 ]; then
+					icon="headphones:$hp"
+				else
+					icon=headphones
+				fi
+			fi
+			printf "row %s %s %s %s %s\n" "$i" "$icon" "$unit" \
+				"$kind" "$sink"
+			i=$(( $i + 1 ))
+		done < "$LIST"
+		if [ "$offer_all" = 1 ]; then
+			printf "row %s all all all %s\n" "$n" "$COMBINE_NAME"
+		fi
+	} > "$tmp" || return $FAILURE
+	mv "$tmp" "$file" || return $FAILURE
+}
+
+cycle_step()
+{
+	local file idx slots old newidx new
+
+	file=$( cycle_file )
+	if [ ! -s "$file" ]; then
+		AOT_INNER=1 AOT_PRIME=1 "$0" || return $FAILURE
+	fi
+	idx=$( awk '$1 == "idx" { print $2; exit }' "$file" )
+	slots=$( awk '$1 == "slots" { print $2; exit }' "$file" )
+	[ "$idx" ] && [ "$slots" ] && [ "$slots" -gt 0 ] || return $FAILURE
+	old=$( awk -v i="$idx" \
+		'$1 == "row" && $2 == i { print $6; exit }' "$file" )
+	newidx=$(( ($idx + 1) % $slots ))
+	new=$( awk -v i="$newidx" \
+		'$1 == "row" && $2 == i { print $6; exit }' "$file" )
+	[ "$old" ] && [ "$new" ] && quietly volume-osd --handoff "$old" "$new"
+	awk -v i="$newidx" \
+		'NR == 1 { print "idx " i; next } { print }' "$file" \
+		> "$file.tmp" || return $FAILURE
+	mv "$file.tmp" "$file" || return $FAILURE
+	awk -v i="$newidx" '$1 == "row" && $2 == i { print $3; exit }' "$file"
+}
+
+cycle_apply()
+{
+	local file idx idx2
+
+	file=$( cycle_file )
+	while :; do
+		idx=$( awk '$1 == "idx" { print $2; exit }' "$file" )
+		[ "$idx" ] || exit $SUCCESS
+		AOT_INNER=1 AOT_QUIET=1 AOT_INDEX="$idx" "$0" || exit $FAILURE
+		idx2=$( awk '$1 == "idx" { print $2; exit }' "$file" )
+		[ "$idx" = "$idx2" ] && break
+	done
+}
+
+show_slot_gauge()
+{
+	local file idx sink
+	local mem="${HOME:-/tmp}/.cache/audio-output-volumes"
+	local lvl="${HOME:-/tmp}/.cache/volume-osd.level"
+	local pct= m lmark lk mute=0
+
+	file=$( cycle_file )
+	idx=$( awk '$1 == "idx" { print $2; exit }' "$file" )
+	sink=$( awk -v i="$idx" \
+		'$1 == "row" && $2 == i { print $6; exit }' "$file" )
+	if [ -s "$lvl" ]; then
+		read pct m lmark lk < "$lvl" || pct=
+		if [ "$lk" != "$sink" ]; then
+			pct=
+		fi
+	fi
+	if [ ! "$pct" ]; then
+		pct=$( awk -v k="$sink" '$1 == k { print $2; exit }' "$mem" \
+			2> /dev/null ) || pct=
+	fi
+	[ "$pct" ] || pct=0
+	if [ -s "$lvl" ]; then
+		m=$( awk '{ print $2; exit }' "$lvl" )
+		if [ "$m" = 1 ]; then
+			mute=1
+		fi
+	fi
+	have bosd || return $SUCCESS
+	if [ "$mute" = 1 ]; then
+		quietly bosd -p muted -G red -P "$pct" -g "$pct" &
+	else
+		quietly bosd -P "$pct" -g "$pct" &
+	fi
+}
+
+cycle_fast()
+{
+	local icon
+
+	icon=$( lockf -t 0 -k "$AOT_LOCK.step" "$0" --step ) || exit $SUCCESS
+	quietly audio-output-osd "$icon" &
+	show_slot_gauge
+	quietly lockf -t 0 -k "$AOT_LOCK" "$0" --apply &
+}
+
+#
+# Greeter (and SSH tests) need the private session bus start-pulseaudio left;
+# without it pactl auto-spawns a broken Pulse and default-sink stays stuck.
+#
+load_pulse_dbus_env()
+{
+	local file="$XDG_RUNTIME_DIR/pulse-dbus.env"
+
+	# Greeter system Pulse needs no session bus. Session path may.
+	[ ! "$BHOTKEYS_GREETER" ] || return $SUCCESS
+	[ ! "$PULSE_SERVER" ] || return $SUCCESS
+	[ -f "$file" ] || return $SUCCESS
+
+	# shellcheck disable=SC1090
+	. "$file"
+	export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
+}
+
+#
+# Never let root poison the session user's Pulse dir (optional:
+# FLORENCE_GREETER_USER names the account that owns XDG_RUNTIME_DIR).
+#
+reclaim_session_pulse()
+{
+	local user="$FLORENCE_GREETER_USER"
+	local xdg="/var/run/xdg/$user"
+	local pulse="$xdg/pulse"
+	local owner pid
+
+	[ "$user" ] || return $SUCCESS
+	[ -e "$pulse" ] || return $SUCCESS
+
+	owner=$( stat -f %u "$pulse" 2> /dev/null ) || owner=
+	[ "$owner" = "0" ] || return $SUCCESS
+
+	aot_log "reclaim root-owned $pulse"
+
+	if [ -f "$pulse/pid" ]; then
+		pid=$( cat "$pulse/pid" 2> /dev/null ) || pid=
+		if [ "$pid" ]; then
+			quietly kill "$pid"
+			sleep 0.15
+			quietly kill -9 "$pid"
+		fi
+	fi
+
+	rm -rf "$pulse"
+	quietly chown "$user:$user" "$xdg"
+	quietly chmod 755 "$xdg"
+}
+
+# Snapshot pct (per-output) and mute (global carry); remember pct only.
+vol_before_switch()
+{
+	prev_pct=
+	prev_mute=
+	prev_pct=$( volume-osd pct 2> /dev/null | tr -d ' \n' ) ||
+		prev_pct=
+	prev_mute=$( volume-osd mute-status 2> /dev/null |
+		tr -d ' \n' ) || prev_mute=
+	quietly volume-osd save
+}
+
+#
+# Restore this output's remembered pct. Re-apply mute as a global carry.
+# Do not show the volume bar here. The caller shows the glyph first.
+# Fast cycle passes the destination sink so one output's level is not
+# written onto whichever sink pactl names mid-switch.
+#
+vol_after_switch()
+{
+	local sink="$1"
+
+	if [ "$AOT_INDEX" ]; then
+		[ "$sink" ] && quietly volume-osd --apply-saved "$sink"
+		return $SUCCESS
+	fi
+
+	quietly volume-osd restore "$prev_pct"
+	[ "$prev_mute" ] && quietly volume-osd apply-mute "$prev_mute"
+}
+
+show_output_then_volume()
+{
+	local icon="$1"
+
+	# Optional handoff file (tests / alternate front-ends).
+	if [ "$AOT_ICON_FILE" ]; then
+		echo "$icon" > "$AOT_ICON_FILE"
+		volume-osd pct 2> /dev/null |
+			tr -d ' \n' > "$AOT_ICON_FILE.pct" ||
+			echo 0 > "$AOT_ICON_FILE.pct"
+		volume-osd mute-status 2> /dev/null |
+			tr -d ' \n' > "$AOT_ICON_FILE.mute" ||
+			echo off > "$AOT_ICON_FILE.mute"
+		aot_log "wrote icon $icon -> $AOT_ICON_FILE"
+		return $SUCCESS
+	fi
+
+	# Glyph first (UDP replace while held); volume bar follows so a hung
+	# bar path never blocks the icon update under rapid Fn+F12.
+	quietly audio-output-osd "$icon" &
+	quietly volume-osd show &
+	aot_log "show_output_then_volume $icon"
+}
+
+############################################################ MAIN
+
+case "${1:-}" in
+"") [ ! "$2" ] || usage ;; # NOTREACHED
+--step)
+	[ ! "$2" ] || usage # NOTREACHED
+	cycle_step || exit $FAILURE
+	exit $SUCCESS
+	;;
+--apply)
+	[ ! "$2" ] || usage # NOTREACHED
+	cycle_apply
+	exit $SUCCESS
+	;;
+*) usage # NOTREACHED
+esac
+if [ ! "$AOT_INNER" ]; then
+	cycle_fast
+	exit $SUCCESS
+fi
+
+aot_log "start user=$USER greeter=$BHOTKEYS_GREETER" \
+	"pulse_server=$PULSE_SERVER xdg=$XDG_RUNTIME_DIR xa=${XAUTHORITY:+set}"
+load_pulse_dbus_env
+
+if [ "$BHOTKEYS_GREETER" ] && [ "$( id -u )" -eq 0 ]; then
+	reclaim_session_pulse
+fi
+
+if ! have pactl; then
+	echo "pactl not found" >&2
+	exit $FAILURE
+fi
+
+if ! quietly pactl info; then
+	if [ "$BHOTKEYS_GREETER" ]; then
+		aot_log "greeter: no system Pulse on ${PULSE_SERVER:-?}"
+		echo "audio-output-toggle: greeter Pulse not running" >&2
+		exit $FAILURE
+	fi
+	if have "$START_PA"; then
+		"$START_PA" || exit $FAILURE
+	else
+		echo "PulseAudio is not running" >&2
+		exit $FAILURE
+	fi
+fi
+
+"$DEVICES" > "$LIST" || {
+	rm -f "$LIST"
+	exit $FAILURE
+}
+
+n=$( awk 'END { print NR }' "$LIST" )
+if [ ! "$n" ] || [ "$n" -lt 1 ]; then
+	rm -f "$LIST"
+	echo "audio-output-toggle: no playable outputs" >&2
+	exit $FAILURE
+fi
+
+# Offer "all" when two or more playable sinks exist.
+offer_all=0
+[ "$n" -ge 2 ] && have "$ALL_TEST" && offer_all=1
+# Virtual slots: 0..n-1 devices, then optional ALL at index n.
+slots=$n
+[ "$offer_all" = 1 ] && slots=$(( $n + 1 ))
+
+default=$( pactl get-default-sink 2> /dev/null ||
+	pactl info 2> /dev/null | awk '/^Default Sink:/ { print $3 }' )
+
+# Index of current selection (0-based); n means ALL when offer_all.
+cur=-1
+case "$default" in
+"$COMBINE_NAME"|combined*|all_outputs*|all-outputs*)
+	if [ "$offer_all" = 1 ]; then
+		cur=$n
+	fi
+	;;
+esac
+# Leftover combine module with a drifted default still counts as ALL.
+if [ "$cur" -lt 0 ] && [ "$offer_all" = 1 ]; then
+	case "$( "$ALL_TEST" status 2> /dev/null )" in
+	*combine=on*)
+		cur=$n
+		;;
+	esac
+fi
+
+if [ "$cur" -lt 0 ]; then
+	i=0
+	while read -r unit kind sink desc; do
+		if [ "$sink" = "$default" ]; then
+			cur=$i
+			break
+		fi
+		case "$default" in
+		*"dsp$unit"*|*"dsp.$unit"*)
+			cur=$i
+			break
+			;;
+		esac
+		i=$(( $i + 1 ))
+	done < "$LIST"
+fi
+
+if [ "$cur" -lt 0 ]; then
+	default_unit=$( sysctl -n hw.snd.default_unit 2> /dev/null || echo "" )
+	i=0
+	while read -r unit kind sink desc; do
+		if [ "$default_unit" ] && [ "$unit" = "$default_unit" ]; then
+			cur=$i
+			break
+		fi
+		i=$(( $i + 1 ))
+	done < "$LIST"
+fi
+
+if [ "$AOT_PRIME" ]; then
+	save=$cur
+	[ "$save" -ge 0 ] || save=0
+	if ! write_cycle "$save"; then
+		rm -f "$LIST"
+		exit $FAILURE
+	fi
+	rm -f "$LIST"
+	exit $SUCCESS
+fi
+if [ "$AOT_INDEX" ]; then
+	next=$AOT_INDEX
+	if [ "$slots" -gt 0 ]; then
+		next=$(( $next % $slots ))
+	fi
+else
+	next=$(( ($cur + 1) % $slots ))
+	[ "$cur" -lt 0 ] && next=0
+fi
+
+if [ ! "$AOT_INDEX" ]; then
+	vol_before_switch
+fi
+
+# --- Select ALL (combine) -------------------------------------------------
+if [ "$offer_all" = 1 ] && [ "$next" -eq "$n" ]; then
+	rm -f "$LIST"
+	if ! quietly "$ALL_TEST" on; then
+		echo "audio-output-toggle: ALL combine failed" >&2
+		exit $FAILURE
+	fi
+	icon=all
+	vol_after_switch "$COMBINE_NAME"
+	if [ ! "$AOT_QUIET" ]; then
+		show_output_then_volume "$icon"
+	fi
+	exit $SUCCESS
+fi
+
+# --- Select a single device -----------------------------------------------
+# Leaving combine (or a leftover combine module): unload so streams move
+# to a real sink.  Detect by default name or by a live combine module.
+need_off=0
+case "$default" in
+"$COMBINE_NAME"|combined*|all_outputs*|all-outputs*)
+	need_off=1
+	;;
+esac
+if [ "$need_off" = 0 ] && have "$ALL_TEST"; then
+	case "$( "$ALL_TEST" status 2> /dev/null )" in
+	*combine=on*)
+		need_off=1
+		;;
+	esac
+fi
+[ "$need_off" = 1 ] && quietly "$ALL_TEST" off
+
+i=0
+target_unit=
+target_kind=
+target_sink=
+target_desc=
+while read -r unit kind sink desc; do
+	if [ "$i" -eq "$next" ]; then
+		target_unit="$unit"
+		target_kind="$kind"
+		target_sink="$sink"
+		target_desc="$desc"
+		break
+	fi
+	i=$(( $i + 1 ))
+done < "$LIST"
+
+if [ ! "$target_sink" ]; then
+	rm -f "$LIST"
+	echo "audio-output-toggle: failed to pick next output" >&2
+	exit $FAILURE
+fi
+
+hp_index=0
+if [ "$target_kind" = "headphones" ]; then
+	hp_index=$(
+		awk -v want="$target_unit" '
+			$2 == "headphones" {
+				n++
+				if ($1 == want) { print n; exit }
+			}
+		' "$LIST"
+	)
+fi
+rm -f "$LIST"
+
+if ! pactl set-default-sink "$target_sink" 2> /dev/null; then
+	echo "audio-output-toggle: failed to set default sink $target_sink" >&2
+	aot_log "FAIL set-default-sink $target_sink"
+	exit $FAILURE
+fi
+aot_log "set-default-sink $target_sink"
+
+pactl list short sink-inputs 2> /dev/null | while read -r id sink rest; do
+	[ "$id" ] || continue
+	# Skip combine's internal slave inputs if somehow still present.
+	sname=$( pactl list short sinks 2> /dev/null |
+		awk -v i="$sink" '$1==i {print $2; exit}' )
+	case "$sname" in
+	"$COMBINE_NAME"|combined*) continue ;;
+	esac
+	pactl move-sink-input "$id" "$target_sink" 2> /dev/null
+done
+
+if quietly sysctl hw.snd.default_unit="$target_unit"; then
+	aot_log "hw.snd.default_unit=$target_unit"
+else
+	aot_log "WARN sysctl hw.snd.default_unit=$target_unit failed"
+fi
+if [ -e "/dev/mixer$target_unit" ]; then
+	# Full pcm only; leave mute alone (per-output memory restores it)
+	quietly "$MIXER" -f "/dev/mixer$target_unit" pcm=100% ||
+		quietly "$MIXER" -f "/dev/mixer$target_unit" pcm=1.00
+fi
+
+icon=speakers
+if [ "$target_kind" = "headphones" ]; then
+	if [ "$n" -gt 2 ] && [ "$hp_index" ] && [ "$hp_index" -ge 2 ]; then
+		icon="headphones:$hp_index"
+	else
+		icon=headphones
+	fi
+fi
+
+vol_after_switch "$target_sink"
+
+if [ ! "$AOT_QUIET" ]; then
+	show_output_then_volume "$icon"
+fi
+
+exit $SUCCESS
+
+################################################################################
+# END
+################################################################################

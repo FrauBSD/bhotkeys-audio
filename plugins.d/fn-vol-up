@@ -1,0 +1,9 @@
+id fn-vol-up
+group x11/bhotkeys-audio
+label Volume up
+chord XF86AudioRaiseVolume
+enabled 0 gnome i3 mate
+command volume-osd up
+repeat 1
+greeter 1
+desc Raise the active output three bar ticks.

@@ -1,0 +1,9 @@
+id fn-vol-down
+group x11/bhotkeys-audio
+label Volume down
+chord XF86AudioLowerVolume
+enabled 0 gnome i3 mate
+command volume-osd down
+repeat 1
+greeter 1
+desc Lower the active output three bar ticks.

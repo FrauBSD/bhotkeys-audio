@@ -1,0 +1,23 @@
+# $FrauBSD: bhotkeys-audio/.git-hooks/README 2026-10-05 17:36:32 -0700 Devin Teske $
+
+!! ATTENTION DEVELOPERS AND CONTRIBUTORS !!
+
+To get RCS Keywords (like the FrauBSD one at the top of this file) to expand,
+follow these steps before using `git commit' in this project:
+
+   $ .git-hooks/install.sh
+
+Cheers!
+
+Supported keywords:
+
+	$Author: Devin Teske $
+	$Branch: master $
+	$Date: 2026-10-05 17:36:32 -0700 $
+	$Header: .git-hooks/README 2026-10-05 17:36:32 -0700 Devin Teske $
+	$Origin: git@github.com:FrauBSD/bhotkeys-audio.git $
+	$Project: FrauBSD/bhotkeys-audio.git $
+	$RCSfile: README $
+	$Source: .git-hooks/README $
+	$FrauBSD: bhotkeys-audio/.git-hooks/README 2026-10-05 17:36:32 -0700 Devin Teske $
+

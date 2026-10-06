@@ -1,0 +1,63 @@
+.\" Copyright (c) 2026 Devin Teske <dteske@FreeBSD.org>
+.\"
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.Dd October 4, 2026
+.Dt AUDIO-OUTPUT-DEVICES 1
+.Os
+.Sh NAME
+.Nm audio-output-devices
+.Nd list playable audio outputs
+.Sh SYNOPSIS
+.Nm
+.Sh DESCRIPTION
+.Nm
+prints one line per playable output, ordered by pcm unit:
+.Bd -literal -offset indent
+pcm kind sink description
+.Ed
+.Pp
+.Ar pcm
+is the unit number.
+.Ar kind
+is
+.Cm speakers
+or
+.Cm headphones .
+A description that names the internal analog output or the
+built-in speakers is
+.Cm speakers .
+Every other playback device is
+.Cm headphones ,
+including a headphone jack, a USB adapter, and dock audio.
+.Ar sink
+is the Pulse sink name,
+.Cm oss_output.dsp Ns Ar pcm .
+.Ar description
+is the rest of the line.
+.Pp
+When
+.Xr pactl 1
+can reach a daemon,
+.Nm
+loads
+.Cm module-oss
+for each playable
+.Pa /dev/dsp Ns Ar N
+that does not already have that sink.
+When Pulse has no such sinks, the list is taken from
+.Pa /dev/sndstat .
+.Sh FILES
+.Bl -tag -width "/dev/sndstat"
+.It Pa /dev/sndstat
+Playback devices used when Pulse has no
+.Cm oss_output.dsp Ns Ar N
+sink.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh SEE ALSO
+.Xr audio-output-toggle 1 ,
+.Xr pactl 1
+.Sh AUTHORS
+.An Devin Teske Aq Mt dteske@FreeBSD.org

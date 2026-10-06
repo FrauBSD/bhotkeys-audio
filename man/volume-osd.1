@@ -1,0 +1,133 @@
+.\" Copyright (c) 2026 Devin Teske <dteske@FreeBSD.org>
+.\"
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.Dd October 5, 2026
+.Dt VOLUME-OSD 1
+.Os
+.Sh NAME
+.Nm volume-osd
+.Nd change the volume and show the gauge
+.Sh SYNOPSIS
+.Nm Cm up
+.Nm Cm down
+.Nm Cm mute
+.Nm Cm show
+.Nm Cm pct
+.Nm Cm key
+.Nm Cm mute-status
+.Nm Cm save
+.Nm Cm restore
+.Op Ar fallback
+.Nm Cm apply-mute Cm on
+.Nm Cm apply-mute Cm off
+.Sh DESCRIPTION
+.Nm
+changes the active output and paints a gauge through
+.Xr bosd 1 .
+The bar is green while the output is audible and red while it is
+muted.
+Raising or lowering the level does not unmute.
+.Pp
+A single sink uses
+.Xr mixer 8
+.Cm vol
+on the matching
+.Pa /dev/mixer Ns Ar N .
+The combined sink
+.Pq Ev AUDIO_ALL_SINK , default Cm combined_all
+uses Pulse volume on that sink, which fans out to every slave.
+Mixer volume stops at 100.
+The combined sink stops at 153.
+Above 100 the bar stays full and the gauge shows the percent.
+.Cm pcm
+is left at 100.
+.Pp
+The gauge has 56 ticks.
+.Cm up
+and
+.Cm down
+move 3 ticks, which is one 5 percent step on the way up from 0.
+.Pp
+Each sink remembers its last percent in
+.Pa ~/.cache/audio-output-volumes .
+Mute is one state for every sink.
+.Bl -tag -width "mute-status"
+.It Cm up
+Raise the level and show the gauge.
+.It Cm down
+Lower the level and show the gauge.
+.It Cm mute
+Toggle mute and show the gauge at the same level.
+.It Cm show
+Show the gauge for the current level.
+.It Cm pct
+Print the current percent.
+.It Cm key
+Print the active sink name.
+.It Cm mute-status
+Print
+.Cm on
+when muted and
+.Cm off
+when not.
+.It Cm save
+Remember the current percent for this sink.
+.It Cm restore Op Ar fallback
+Apply the remembered percent for this sink.
+When nothing is remembered,
+.Ar fallback
+is used.
+When that is also empty, the current percent is remembered and
+left alone.
+.It Cm apply-mute Cm on
+.It Cm apply-mute Cm off
+Set mute.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width "VOLUME_OSD_MIXER_ONLY"
+.It Ev AUDIO_ALL_SINK
+Name of the combined Pulse sink.
+The default is
+.Cm combined_all .
+.It Ev AUDIO_VOLMEM_FILE
+Per-sink percent file.
+The default is
+.Pa ~/.cache/audio-output-volumes .
+.It Ev DISPLAY
+X server.
+The default is
+.Pa :0 .
+.It Ev PULSE_SERVER
+Pulse socket.
+When set, Pulse is used as given.
+.It Ev BHOTKEYS_GREETER
+When set, the system Pulse socket
+.Pa /var/run/pulse/native
+is used and a user session socket is not.
+.It Ev VOLUME_OSD_NO_PULSE
+When set, use the mixer only.
+.It Ev VOLUME_OSD_MIXER_ONLY
+When set, use the mixer only.
+.It Ev VOLUME_OSD_PACTL_TIMEOUT
+Seconds
+.Xr pactl 1
+may block.
+The default is 0.35.
+.El
+.Sh FILES
+.Bl -tag -width "~/.cache/audio-output-volumes"
+.It Pa ~/.cache/audio-output-volumes
+Remembered percent, one
+.Dq key percent
+line per sink.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh SEE ALSO
+.Xr audio-output-toggle 1 ,
+.Xr bhotkeys 1 ,
+.Xr bosd 1 ,
+.Xr mixer 8
+.Sh AUTHORS
+.An Devin Teske Aq Mt dteske@FreeBSD.org

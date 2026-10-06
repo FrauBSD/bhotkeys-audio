@@ -1,0 +1,9 @@
+id fn-audio-out
+group x11/bhotkeys-audio
+label Audio output
+chord XF86AudioMedia
+chord Shift+XF86AudioMedia gnome mate
+command audio-output-toggle
+repeat 0
+greeter 1
+desc Fn+F12. Cycle speakers, headphones, and all outputs.

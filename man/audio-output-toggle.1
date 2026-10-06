@@ -1,0 +1,65 @@
+.\" Copyright (c) 2026 Devin Teske <dteske@FreeBSD.org>
+.\"
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.Dd October 5, 2026
+.Dt AUDIO-OUTPUT-TOGGLE 1
+.Os
+.Sh NAME
+.Nm audio-output-toggle
+.Nd cycle the default audio output
+.Sh SYNOPSIS
+.Nm
+.Sh DESCRIPTION
+.Nm
+cycles the default playback device through the playable outputs
+from
+.Xr audio-output-devices 1 ,
+then a combined sink that plays them all, then back to the first.
+The usual chord is the media key
+.Pq Fn+F12 .
+.Pp
+The glyph is
+.Xr audio-output-osd 1 :
+speakers, headphones, headphones with a count when more than two
+outputs are playable, or speakers with an All badge for the
+combined sink.
+.Xr volume-osd 1
+then follows the newly selected sink.
+.Pp
+A held key steps the glyph once per press.
+One applier catches up to the latest choice.
+.Sh ENVIRONMENT
+.Bl -tag -width "BHOTKEYS_GREETER"
+.It Ev AUDIO_ALL_SINK
+Name of the combined Pulse sink.
+The default is
+.Cm combined_all .
+.It Ev DISPLAY
+X server.
+The default is
+.Pa :0 .
+.It Ev PULSE_SERVER
+Pulse socket.
+.It Ev BHOTKEYS_GREETER
+When set, the system Pulse socket is used.
+.It Ev HOME
+Directory above
+.Pa .cache/audio-output-cycle .
+.El
+.Sh FILES
+.Bl -tag -width "~/.cache/audio-output-cycle"
+.It Pa ~/.cache/audio-output-cycle
+Latest cycle choice.
+.It Pa /tmp/audio-output-toggle.lock
+Lock around one cycle.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh SEE ALSO
+.Xr audio-output-devices 1 ,
+.Xr audio-output-osd 1 ,
+.Xr bhotkeys 1 ,
+.Xr volume-osd 1
+.Sh AUTHORS
+.An Devin Teske Aq Mt dteske@FreeBSD.org

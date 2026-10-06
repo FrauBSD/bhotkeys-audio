@@ -1,0 +1,9 @@
+id fn-mute
+group x11/bhotkeys-audio
+label Mute
+chord XF86AudioMute
+enabled 0 gnome i3 mate
+command volume-osd mute
+repeat 0
+greeter 1
+desc Mute or unmute. The level does not change.

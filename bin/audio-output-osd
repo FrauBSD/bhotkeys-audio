@@ -1,0 +1,62 @@
+#!/bin/sh
+############################################################ LICENSE
+#
+# Copyright (c) 2026 Devin Teske <dteske@FreeBSD.org>
+#
+# SPDX-License-Identifier: BSD-2-Clause
+#
+############################################################ IDENT(1)
+#
+# $Title: Show the audio-output glyph $
+# $Copyright: 2026 Devin Teske. All rights reserved. $
+# $FrauBSD: bhotkeys-audio/bin/audio-output-osd 2026-10-05 17:36:32 -0700 Devin Teske $
+#
+############################################################ INFORMATION
+#
+# speakers, headphones, headphones:N, or all.
+# all is the speaker glyph with an All badge.
+# headphones:N (N at least 2) is the headphone glyph with badge N.
+#
+############################################################ ENVIRONMENT
+
+DISPLAY="${DISPLAY:-:0}"
+export DISPLAY
+
+############################################################ GLOBALS
+
+pgm="${0##*/}" # Program basename
+
+HOLD="${AUDIO_OUTPUT_OSD_HOLD:-1.4}"
+
+############################################################ FUNCTIONS
+
+usage()
+{
+	exec >&2
+	echo "Usage: $pgm speakers|headphones|headphones:N|all"
+	exit 1
+}
+
+############################################################ MAIN
+
+mode="$1"
+[ "$mode" ] || usage # NOTREACHED
+
+case "$mode" in
+speakers) exec bosd audio-speakers "$HOLD" ;;
+headphones) exec bosd audio-headphones "$HOLD" ;;
+all) exec bosd -b All audio-speakers "$HOLD" ;;
+headphones:[1-9]|headphones:[1-9][0-9])
+	n="${mode#headphones:}"
+	if [ "$n" -ge 2 ] 2> /dev/null; then
+		exec bosd -b "$n" audio-headphones "$HOLD"
+	fi
+	exec bosd audio-headphones "$HOLD"
+	;;
+*)
+	usage # NOTREACHED
+esac
+
+################################################################################
+# END
+################################################################################
