@@ -9,7 +9,7 @@
 #
 # $Title: Cycle the default audio output $
 # $Copyright: 2026 Devin Teske. All rights reserved. $
-# $FrauBSD: bhotkeys-audio/bin/audio-output-toggle 2026-10-05 17:36:32 -0700 Devin Teske $
+# $FrauBSD: bhotkeys-audio/bin/audio-output-toggle 2026-10-05 19:02:15 -0700 Devin Teske $
 #
 ############################################################ INFORMATION
 #
@@ -211,11 +211,10 @@ show_slot_gauge()
 			mute=1
 		fi
 	fi
-	have bosd || return $SUCCESS
 	if [ "$mute" = 1 ]; then
-		quietly bosd -p muted -G red -P "$pct" -g "$pct" &
+		bosd -p muted -G red -P "$pct" -g "$pct" &
 	else
-		quietly bosd -P "$pct" -g "$pct" &
+		bosd -P "$pct" -g "$pct" &
 	fi
 }
 

@@ -1,10 +1,15 @@
-[//]: # ($FrauBSD: bhotkeys-audio/CHANGELOG.md 2026-10-05 17:36:32 -0700 Devin Teske $)
+[//]: # ($FrauBSD: bhotkeys-audio/CHANGELOG.md 2026-10-05 19:02:15 -0700 Devin Teske $)
 
 # Changelog
 
 Newest first. Each section is a git tag; the bullets are what landed
 in that tag (from the previous tag, or from the start of the
 repository for 1.0).
+
+## 1.1 (2026-10-05)
+
+- `audio-output-toggle` calls `bosd` for the slot gauge without
+  skipping the call or discarding its output
 
 ## 1.0 (2026-10-04)
 
