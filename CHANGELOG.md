@@ -1,4 +1,4 @@
-[//]: # ($FrauBSD: bhotkeys-audio/CHANGELOG.md 2026-10-12 11:10:20 -0700 Devin Teske $)
+[//]: # ($FrauBSD: bhotkeys-audio/CHANGELOG.md 2026-10-12 11:16:31 -0700 Devin Teske $)
 
 # Changelog
 
@@ -10,6 +10,8 @@ repository for 1.0).
 
 - on the combined sink, `volume-osd up` steps past 100% and
   stops at 153%
+- Clean-up volume-osd case  statements, removing optional ;;
+  from fall-back (*) case patterns
 
 ## 1.1 (2026-10-05)
 

@@ -9,7 +9,7 @@
 #
 # $Title: Adjust the active output and show the gauge $
 # $Copyright: 2026 Devin Teske. All rights reserved. $
-# $FrauBSD: bhotkeys-audio/bin/volume-osd 2026-10-12 11:10:20 -0700 Devin Teske $
+# $FrauBSD: bhotkeys-audio/bin/volume-osd 2026-10-12 11:14:36 -0700 Devin Teske $
 #
 ############################################################ INFORMATION
 #
@@ -216,7 +216,7 @@ mix()
 	#
 	case "$*" in
 	*=*) quietly $MIXER -f "$MIX_DEV" "$@" ;;
-	*) $MIXER -f "$MIX_DEV" "$@" ;;
+	*) $MIXER -f "$MIX_DEV" "$@"
 	esac
 }
 
@@ -413,7 +413,7 @@ apply_mute()
 
 	case "$mute" in
 	on|off) : ok ;;
-	*) return $FAILURE ;;
+	*) return $FAILURE
 	esac
 	if is_combine_master; then
 		ensure_pulse_env
@@ -456,7 +456,6 @@ apply_pct_key()
 		;;
 	*)
 		apply_pct "$n"
-		;;
 	esac
 }
 
@@ -469,7 +468,7 @@ apply_mute_key()
 	on|off) : ok ;;
 	1) how=on ;;
 	0) how=off ;;
-	*) return $FAILURE ;;
+	*) return $FAILURE
 	esac
 	case "$key" in
 	"$COMBINE_NAME"|combined*|all_outputs*|all-outputs*)
@@ -495,7 +494,6 @@ apply_mute_key()
 		;;
 	*)
 		apply_mute "$how"
-		;;
 	esac
 }
 
@@ -616,7 +614,6 @@ next_pct()
 		;;
 	*)
 		nudge_pct "$cur" "$dir"
-		;;
 	esac
 }
 
@@ -707,7 +704,6 @@ step_level()
 			mark="$old"
 		fi
 		pct=$( next_pct "$old" "$dir" "$key" )
-		;;
 	esac
 	printf "%s %s %s %s\n" "$pct" "$mute" "$mark" "$key" > "$file"
 	if [ "$mark" = "$pct" ]; then
