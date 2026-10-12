@@ -9,7 +9,7 @@
 #
 # $Title: Adjust the active output and show the gauge $
 # $Copyright: 2026 Devin Teske. All rights reserved. $
-# $FrauBSD: bhotkeys-audio/bin/volume-osd 2026-10-05 17:36:32 -0700 Devin Teske $
+# $FrauBSD: bhotkeys-audio/bin/volume-osd 2026-10-12 11:10:20 -0700 Devin Teske $
 #
 ############################################################ INFORMATION
 #
@@ -574,10 +574,10 @@ pct_for_ticks()
 }
 
 #
-# $1 current percent, $2 up|down. Above 100 (Pulse combine) up stays
-# at the cap. A full bar steps down by 2 ticks; every other step is 3.
-# Climbing from 0 is 3 ticks until the last step (2), so down from 100
-# must use that same 2 or the earlier stops are skipped.
+# $1 current percent, $2 up|down. Mixer bar, 0 to 100.
+# A full bar steps down by 2 ticks; every other step is 3.
+# Climbing from 0 is 3 ticks until the last step (2), so down
+# from 100 must use that same 2 or the earlier stops are skipped.
 #
 nudge_pct()
 {
@@ -587,14 +587,6 @@ nudge_pct()
 	case "$cur" in
 	""|*[!0-9]*) cur=0 ;;
 	esac
-	if [ "$cur" -gt 100 ]; then
-		if [ "$dir" = up ]; then
-			echo "$PA_VOL_MAX"
-			return
-		fi
-		pct_for_ticks $(( $TICKS - 2 ))
-		return
-	fi
 	t=$( ticks_for "$cur" )
 	if [ "$dir" = up ]; then
 		t=$(( $t + $NUDGE ))
@@ -606,6 +598,26 @@ nudge_pct()
 	[ "$t" -lt 0 ] && t=0
 	[ "$t" -gt "$TICKS" ] && t="$TICKS"
 	pct_for_ticks "$t"
+}
+
+# $1 current percent, $2 up|down, $3 sink key.
+# Combine steps 5% and stops at PA_VOL_MAX. A mixer stays on the bar.
+next_pct()
+{
+	local cur="$1" dir="$2" key="$3"
+
+	case "$key" in
+	"$COMBINE_NAME"|combined*|all_outputs*|all-outputs*)
+		if [ "$dir" = up ]; then
+			pa_next_up "$cur"
+		else
+			pa_next_down "$cur"
+		fi
+		;;
+	*)
+		nudge_pct "$cur" "$dir"
+		;;
+	esac
 }
 
 show_gauge()
@@ -694,7 +706,7 @@ step_level()
 		if [ "$fresh" = 0 ] || [ ! "$mark" ]; then
 			mark="$old"
 		fi
-		pct=$( nudge_pct "$old" "$dir" )
+		pct=$( next_pct "$old" "$dir" "$key" )
 		;;
 	esac
 	printf "%s %s %s %s\n" "$pct" "$mute" "$mark" "$key" > "$file"
@@ -834,13 +846,13 @@ fi
 case "$1" in
 up)
 	prev=$( current_pct )
-	apply_pct "$( nudge_pct "$prev" up )"
+	apply_pct "$( next_pct "$prev" up "$( output_key )" )"
 	save_current
 	show_gauge "$prev" "$( current_pct )"
 	;;
 down)
 	prev=$( current_pct )
-	apply_pct "$( nudge_pct "$prev" down )"
+	apply_pct "$( next_pct "$prev" down "$( output_key )" )"
 	save_current
 	show_gauge "$prev" "$( current_pct )"
 	;;
